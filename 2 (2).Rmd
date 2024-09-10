@@ -1,0 +1,1276 @@
+---
+title: "Untitled"
+author: "Zahra Mousavi"
+date: "2024-03-22"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(dplyr)
+library(glmnet)
+library(recipes)
+library(parsnip)
+library(lubridate)
+library(forecast)
+library(stats)
+library(randomForest)
+library(caret)
+library(gbm)
+library(keras)
+library(tune)
+library(parsnip)
+library(zoo)
+library(mgcv)
+library(car)
+library(ggplot2)
+library(corrplot)
+library(reshape2)
+library(ggplot2)
+```
+
+
+
+################################################################################
+## fitting with ARIMAX
+
+```{r}
+
+Completed_data <- read_csv("complete_data.csv")
+# Create dummy variables
+dummies <- model.matrix(~ NAICS - 1, data = Completed_data)
+
+# Add dummy variables to the dataset
+Completed_data <- cbind(Completed_data, dummies)
+
+Completed_data$Date <- as.Date(as.yearmon(Completed_data$Date))
+
+
+# Function to fit ARIMA model and forecast missing values for each industry
+forecast_missing_values_arimax <- function(industry_data) {
+  # Check for missing values in Mean_Volume.y
+  if (anyNA(industry_data$Mean_Volume.y)) {
+    stop("Missing values detected in the predictor columns. Please handle missing values before fitting the ARIMA model.")
+  }
+  
+  # Filter data before 2020-03-01
+  train_data <- subset(industry_data, Date < as.Date("2020-03-01"))
+  
+  # Extract time series data
+  ts_data <- ts(train_data$Job_vacancies_Value, frequency = 12)
+  
+  # Fit ARIMA model with auto.arima()
+  arima_model <- auto.arima(ts_data, xreg = train_data$Mean_Volume.y)
+  # Forecast missing values for the period between 2020-03-01 to 2020-09-01
+  forecast_values <- forecast(arima_model, xreg = rep(train_data$Mean_Volume.y[nrow(train_data)], 6), h = 6)  # Forecast for 6 months (March to September)
+  
+  # Extract the forecasted values
+  forecasted_values <- forecast_values$mean
+  
+  # Return forecasted values
+  return(forecasted_values)
+}
+
+# Iterate over unique industries and forecast missing values
+unique_industries <- unique(Completed_data$NAICS)
+forecast_results <- lapply(unique_industries, function(industry) {
+  industry_data <- subset(Completed_data, NAICS == industry)
+  forecast_missing_values_arimax(industry_data)
+})
+
+
+
+
+
+# Function to fill missing values in Job Vacancy Value column using ARIMA forecasts
+fill_missing_values <- function(data) {
+  # Iterate over unique industries
+  for (industry in unique(data$NAICS)) {
+    # Subset data for the current industry
+    industry_data <- subset(data, NAICS == industry)
+    
+    # Find rows with missing Job Vacancy Value
+    missing_rows <- is.na(industry_data$Job_vacancies_Value)
+    
+    # Forecast missing values using ARIMA model
+    forecast_values <- forecast_missing_values_arimax(industry_data)
+    
+    # Check if the length of forecast values matches the number of missing values
+    if (length(forecast_values) != sum(missing_rows)) {
+      warning(paste("Length of forecast values does not match the number of missing values for industry", industry))
+      next  # Skip to the next industry if lengths don't match
+    }
+    
+    # Fill missing values with forecasted values
+    industry_data$Job_vacancies_Value[missing_rows] <- forecast_values
+    
+    # Update the original dataset with filled values
+    data[data$NAICS == industry, "Job_vacancies_Value"] <- industry_data$Job_vacancies_Value
+  }
+  
+  # Return the updated dataset
+  return(data)
+}
+
+# Fill missing values in Completed_data
+Completed_data_filled <- fill_missing_values(Completed_data)
+
+#remove duplicates
+# Identify duplicated rows based on NAICS and Date columns, keeping the original
+duplicates <- duplicated(Completed_data_filled[c("NAICS", "Date")]) | duplicated(Completed_data_filled[c("NAICS", "Date")], fromLast = TRUE)
+
+# Remove duplicated rows
+Completed_data_filled <- Completed_data_filled[!duplicates | !duplicated(Completed_data_filled[c("NAICS", "Date")], fromLast = TRUE), ]
+
+
+
+
+
+```
+
+
+## plotting the Values
+```{r}
+# Load the ggplot2 library
+library(ggplot2)
+
+# Convert Date column to Date format if it's not already
+Completed_data_filled$Date <- as.Date(Completed_data_filled$Date)
+
+# Create the line plot
+ggplot(Completed_data_filled, aes(x = Date, y = Job_vacancies_Value, color = NAICS)) +
+  geom_line() +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +  # Adjust x-axis date breaks and labels
+  labs(x = "Date", y = "Job Vacancies Value", color = "NAICS") +  # Set axis labels and legend title
+  theme_minimal()  # Set plot theme
+ 
+
+```
+
+
+#######
+## adding money Market to Original data
+
+```{r}
+MoneyM <- read.csv("C:/Users/moham/OneDrive/Desktop/money_market (2).csv")
+MoneyM <- slice(MoneyM, 4411:nrow(MoneyM))
+#MoneyM <- subset(MoneyM , select = c("date" , "CL.CDN.MOST.1D" , "AVG.INTWO" , "TB.CDN.30D.MID", 
+                               #      "TB.CDN.60D.MID" , "TB.CDN.90D.MID" , "TB.CDN.180D.MID" ,  "TB.CDN.1Y.MID"))
+#MoneyM <- slice(MoneyM, 3567:nrow(MoneyM))
+#MoneyM <- slice(MoneyM, 2:nrow(MoneyM))
+
+MoneyM$date <- as.Date(MoneyM$date)
+
+# Extract month and year from the date column
+MoneyM$month_year <- format(MoneyM$date, "%Y-%m")
+
+monthly_mean <- MoneyM %>%
+  group_by(month_year) %>%
+  summarise(across(-date, mean, .names = "mean_{.col}"))
+
+
+# Merge the monthly mean values back to the original data frame
+MoneyM <- merge(MoneyM, monthly_mean, by = "month_year", all.x = TRUE)
+
+# Convert month_year to Date format
+monthly_mean$month_year <- as.Date(paste0(monthly_mean$month_year, "-01"))
+
+# Merge datasets based on matching dates
+merged_data <- merge(Completed_data_filled, monthly_mean, by.x = "Date", by.y = "month_year", all.x = TRUE)
+
+# View the merged data
+head(merged_data)
+
+# Save the merged dataset
+write.csv(merged_data, "merged_dataset.csv", row.names = FALSE)
+
+Completed_data_filled <- merged_data
+
+```
+
+
+# adding the missing rows for the dates
+
+```{r}
+
+# Step 1: Identify unique industries
+unique_industries <- unique(Completed_data_filled$NAICS)
+
+# Step 2: Create rows with NULL values for specified months for each industry
+for (industry in unique_industries) {
+  # Create a sequence of dates for December 2023, January 2024, February 2024, and March 2024
+  missing_dates <- as.Date(c("2023-12-01", "2024-01-01", "2024-02-01", "2024-03-01"))
+  
+  # Iterate over missing dates and add rows with NULL values
+  for (date in missing_dates) {
+    new_row <- data.frame(
+      Date = date,
+      NAICS = industry,
+      Job_vacancies_Value = NA,
+      Mean_Volume.y = NA,
+      mean_TB_CDN_30D_MID = NA
+    )
+    Completed_data_filled <- rbind(Completed_data_filled, new_row)
+  }
+}
+
+# Step 3: Sort the data frame by Date
+Completed_data_filled <- Completed_data_filled[order(Completed_data_filled$Date), ]
+
+write.csv(Completed_data_filled, "Completed_data_filled.csv", row.names = FALSE)
+
+
+
+```
+
+```{r}
+
+unique_industries <- unique(Completed_data_filled$NAICS)
+
+# Create separate scatter plots for each industry
+for (industry in unique_industries) {
+  # Subset data for the current industry
+  industry_data <- Completed_data_filled[Completed_data_filled$NAICS == industry, ]
+  
+  # Calculate correlation coefficient
+  correlation <- cor(industry_data$Job_vacancies_Value, industry_data$Mean_Volume.y, use = "complete.obs")
+  
+  library(ggplot2)
+
+  # Create scatter plot
+  plot(industry_data$Job_vacancies_Value, industry_data$Mean_Volume.y, 
+       xlab = "Job Vacancies Value", ylab = "Mean Volume", 
+       main = paste("Industry:", industry, "\nCorrelation:", round(correlation, 2)))
+  
+
+}
+```
+
+
+```{r}
+correlation_table <- data.frame(Industry = character(), Correlation = numeric(), stringsAsFactors = FALSE)
+
+# Step 3: Calculate correlation coefficients for each industry and store them in the table
+for (industry in unique_industries) {
+  # Subset data for the current industry
+  industry_data <- Completed_data_filled[Completed_data_filled$NAICS == industry, ]
+  
+  # Calculate correlation coefficient
+  correlation <- cor(industry_data$Job_vacancies_Value, industry_data$Mean_Volume.y, use = "complete.obs")
+  
+  # Append to the correlation table
+  correlation_table <- rbind(correlation_table, data.frame(Industry = industry, Correlation = correlation))
+}
+
+# Step 4: Print the correlation table
+print(correlation_table)
+
+
+
+
+# Select only numeric columns
+numeric_cols <- sapply(Completed_data_filled[, -1], is.numeric)  # Exclude the first non-numeric column (Date)
+numeric_data <- Completed_data_filled[, numeric_cols]
+
+# Calculate correlation matrix
+cor_matrix <- numeric_data %>%
+  group_by(NAICS) %>%
+  summarise_all(~ cor(., numeric_data$Job_vacancies_Value))
+
+# Plot correlation matrix
+corrplot(cor_matrix[, -1], method = "color", type = "lower", tl.col = "black", tl.srt = 45)
+
+
+
+
+
+
+industries_unique <- unique(Completed_data_filled$NAICS)
+
+
+# Function to plot correlation matrix for each industry
+plot_correlation <- function(industry, data) {
+  # Subset the data for the current industry
+  subset <- data[data$NAICS == industry, ]
+  
+  # Compute the correlation matrix
+  corr_matrix <- cor(subset[, c("Job_vacancies_Value", "Mean_Volume.y", "mean_CL.CDN.MOST.1DL", "mean_AVG.INTWO", "mean_TB.CDN.30D.MID", "mean_TB.CDN.60D.MID", "mean_TB.CDN.90D.MID", "mean_TB.CDN.180D.MID", "mean_TB.CDN.1Y.MID")])
+  
+  # Plot the correlation matrix
+  corrplot(corr_matrix, method = "color", addrect = 3, type = "lower", tl.col = "black", tl.srt = 45, tl.cex = 0.7, cl.cex = 0.7, number.cex = 0.7, title = paste("Correlation Matrix for", industry))
+}
+
+# Plot correlation matrix for each industry
+for (industry in industries_unique) {
+  plot_correlation(industry, Completed_data_filled)
+}
+
+
+corr_matrix <- cor(Completed_data_filled[, c("Job_vacancies_Value", "Mean_Volume.y", "mean_CL.CDN.MOST.1DL", "mean_AVG.INTWO", "mean_TB.CDN.30D.MID", "mean_TB.CDN.60D.MID", "mean_TB.CDN.90D.MID", "mean_TB.CDN.180D.MID", "mean_TB.CDN.1Y.MID")])
+# Plot the correlation matrix
+corrplot(corr_matrix, method = "color", addrect = 3, type = "lower", tl.col = "black", tl.srt = 45, tl.cex = 0.7, cl.cex = 0.7, number.cex = 0.7, title = "Correlation Matrix for All Industries")
+
+corr_df <- melt(corr_matrix)
+
+# Plot the correlation matrix as a table
+ggplot(melt(corr_df), aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low="blue", high="red", mid="white", midpoint=0, limit=c(-1,1), space="Lab", name="Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title="Correlation Matrix as Table")
+```
+
+
+
+
+```{r}
+
+for (industry in unique_industries) {
+  # Subset data for the current industry
+  industry_data <- Completed_data_filled[Completed_data_filled$NAICS == industry, ]
+  
+  # Calculate correlation coefficient
+  correlation <- cor(industry_data$Job_vacancies_Value, industry_data$mean_TB_CDN_30D_MID, use = "complete.obs")
+  
+  # Create scatter plot
+  plot(industry_data$Job_vacancies_Value, industry_data$Mean_Volume.y, 
+       xlab = "Job Vacancies Value", ylab = "Mean Volume", 
+       main = paste("Industry:", industry, "\nCorrelation:", round(correlation, 2)))
+}
+```
+
+```{r}
+# Create an empty data frame to store the correlation coefficients
+correlationtable2 <- data.frame(Industry = character(), Correlation = numeric(), stringsAsFactors = FALSE)
+
+# Calculate correlation coefficients for each industry and store them in the table
+for (industry in unique_industries) {
+  # Subset data for the current industry
+  industry_data <- Completed_data_filled[Completed_data_filled$NAICS == industry, ]
+  
+  # Calculate correlation coefficient
+  correlation <- cor(industry_data$Job_vacancies_Value, industry_data$mean_TB_CDN_30D_MID, use = "complete.obs")
+  
+  # Append to the correlation table
+  correlationtable2 <- rbind(correlationtable2, data.frame(Industry = industry, Correlation = correlation))
+}
+
+# Print the correlation table
+print(correlationtable2)
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+forecast_values_arimax <- function(industry_data, seasonal = TRUE, stationary = TRUE, stepwise = "both", ic = "aicc", max_order = NULL, max_seasonal_order = NULL) {
+
+  
+  # Check for missing values in Mean_Volume.y and mean_TB_CDN_30D_MID
+  #if (anyNA(industry_data$Mean_Volume.y) || anyNA(industry_data$mean_TB_CDN_30D_MID)) {
+  #  stop("Missing values detected in the predictor columns. Please handle missing values before fitting the ARIMA model.")
+  #}
+  
+  # Split data into training and testing sets
+  #train_index <- sample(1:nrow(industry_data), 0.8 * nrow(industry_data))  # 80% for training
+  #train_data <- industry_data[train_index, ]
+  #test_data <- industry_data[-train_index, ]
+  
+  train_data <- subset(industry_data, industry_data$Date <= "2021-01-01")
+  test_data <- subset(industry_data , industry_data$Date > "2021-01-01")
+  
+  
+  # Extract time series data
+  ts_train_data <- ts(train_data$Job_vacancies_Value, frequency = 12)
+  
+  # Fit ARIMA model with auto.arima()
+  # Call auto.arima with appropriate parameters
+  arima_model <- auto.arima(ts_train_data, 
+                          xreg = cbind(train_data$Mean_Volume.y, train_data$mean_TB_CDN_30D_MID ),#, 
+                                     #  train_data$mean_CL.CDN.MOST.1DL , train_data$mean_AVG.INTWO) , 
+                                      #train_data$mean_TB.CDN.60D.MID , train_data$mean_TB.CDN.90D.MID ,
+                                      #train_data$mean_TB.CDN.180D.MID , train_data$mean_TB.CDN.1Y.MID),
+                          seasonal = seasonal, 
+                          stationary = stationary, 
+                          stepwise = stepwise, 
+                          ic = ic,
+                          max.p = max_order,
+                          max.q = max_order,
+                          max.P = max_seasonal_order,
+                          max.Q = max_seasonal_order)
+
+  
+  # Forecast values for the testing period
+  forecast_xreg <- cbind(test_data$Mean_Volume.y, test_data$mean_TB_CDN_30D_MID)
+  forecast_values <- forecast(arima_model, xreg = forecast_xreg)
+  
+  # Extract the forecasted values
+  forecasted_values <- forecast_values$mean
+  
+  # Calculate RMSE
+  actual_values <- test_data$Job_vacancies_Value
+  rmse <- sqrt(mean((actual_values - forecasted_values)^2))
+  
+  # Calculate R-squared for the model
+  predicted_values <- forecast(arima_model, h = nrow(test_data), xreg = forecast_xreg)$mean
+  rsq <- 1 - sum((actual_values - predicted_values)^2) / sum((actual_values - mean(actual_values))^2)
+  
+  # Return RMSE and R-squared
+  return(list(rmse = rmse, rsq = rsq))
+}
+
+
+
+
+
+
+Completed_data_filled_forecast <- Completed_data_filled
+Completed_data_filled_forecast <- na.omit(Completed_data_filled_forecast)
+Completed_data_filled_forecast$Date <- as.Date(Completed_data_filled_forecast$Date)
+
+
+
+# Initialize lists to store results
+rmse_values <- list()
+rsq_values <- list()
+
+
+# undebug(forecast_values_arimax)
+
+
+
+# Run your loop
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+  
+  # Call the function with the stepwise parameter specified
+  result <- forecast_values_arimax(industry_data, stepwise = TRUE, ic = "aicc")
+  
+  # Store the RMSE and R-squared values
+  rmse_values[[industry]] <- result$rmse
+  # Extract the model summary
+  summary_result <- summary(result)
+
+  # Extract R-squared value
+  rsq <- summary_result$rsquared
+
+  # Get the number of parameters (p + q)
+  num_params <- length(result$coef)
+
+  # Get the number of observations
+  num_obs <- length(result$residuals)
+
+  # Compute adjusted R-squared
+  adjusted_rsq <- 1 - ((1 - rsq) * ((num_obs - 1) / (num_obs - num_params - 1)))
+
+  # Store adjusted R-squared value
+  rsq_values[[industry]] <- adjusted_rsq
+}
+
+# Once done debugging, you can turn off debug mode
+#undebug(forecast_values_arimax) 
+
+
+
+
+
+# Print RMSE values
+print(rmse_values)
+
+# Print R-squared values
+print(rsq_values)
+
+
+
+
+# Iterate over unique industries and forecast missing values
+#unique_industries <- unique(Completed_data_filled_forecast$NAICS)
+#forecast_results <- lapply(unique_industries, function(industry) {
+#  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+#  result <- forecast_values_arimax(industry_data)
+#  rsq <- result$rsq
+#  print(forecasted_values)
+#  print(rsq)
+#})
+
+
+```
+
+
+# Second try
+
+```{r}
+forecast_values_arimax <- function(industry_data, seasonal = TRUE, stationary = TRUE, stepwise = "both", ic = "aicc", max_order = NULL, max_seasonal_order = NULL) {
+
+  
+  # Check for missing values in Mean_Volume.y and mean_TB_CDN_30D_MID
+  #if (anyNA(industry_data$Mean_Volume.y) || anyNA(industry_data$mean_TB_CDN_30D_MID)) {
+  #  stop("Missing values detected in the predictor columns. Please handle missing values before fitting the ARIMA model.")
+  #}
+  
+  # Split data into training and testing sets
+  #train_index <- sample(1:nrow(industry_data), 0.8 * nrow(industry_data))  # 80% for training
+  #train_data <- industry_data[train_index, ]
+  #test_data <- industry_data[-train_index, ]
+  
+  train_data <- subset(industry_data, industry_data$Date <= "2021-01-01")
+  test_data <- subset(industry_data , industry_data$Date > "2021-01-01")
+  
+  
+  # Extract time series data
+  ts_train_data <- ts(train_data$Job_vacancies_Value, frequency = 12)
+  
+  # Fit ARIMA model with auto.arima()
+ # Set the ARIMA model order
+  p <- 2
+  d <- 4
+  q <- 2
+
+  # Set the seasonal order
+  P <- 1
+  D <- 1
+  Q <- 1
+  period <- 12  # Assuming monthly data, adjust accordingly if your data has different frequency
+
+  # Create the ARIMA model
+  arima_model <- auto.arima(ts_train_data, 
+                          xreg = cbind(train_data$Mean_Volume.y, train_data$mean_TB.CDN.1Y.MID ),#, 
+                                     #  train_data$mean_CL.CDN.MOST.1DL , train_data$mean_AVG.INTWO) , 
+                                      #train_data$mean_TB.CDN.60D.MID , train_data$mean_TB.CDN.90D.MID ,
+                                      #train_data$mean_TB.CDN.180D.MID , train_data$mean_TB.CDN.1Y.MID),
+                          seasonal = seasonal, 
+                          stationary = stationary, 
+                          stepwise = stepwise, 
+                          ic = ic,
+                          max.p = max_order,
+                          max.q = max_order,
+                          max.P = max_seasonal_order,
+                          max.Q = max_seasonal_order)
+  plot(industry_data)
+  lines(fitted(arima_model) , col= 'green')
+  
+  # Forecast values for the testing period
+  forecast_xreg <- cbind(test_data$Mean_Volume.y, test_data$mean_TB.CDN.1Y.MID)
+  forecast_values <- forecast(arima_model, xreg = forecast_xreg)
+  arima_model %>% forecast(h=12  ,xreg = forecast_xreg) %>% autoplot()
+  
+  # Extract the forecasted values
+  forecasted_values <- forecast_values$mean
+  
+  # Calculate RMSE
+  actual_values <- test_data$Job_vacancies_Value
+  rmse <- sqrt(mean((actual_values - forecasted_values)^2))
+  
+  # Calculate R-squared for the model
+  predicted_values <- forecast(arima_model, h = nrow(test_data), xreg = forecast_xreg)$mean
+  rsq <- 1 - sum((actual_values - predicted_values)^2) / sum((actual_values - mean(actual_values))^2)
+  
+  # Return RMSE and R-squared
+  return(list(rmse = rmse, rsq = rsq))
+}
+
+
+
+
+
+
+Completed_data_filled_forecast <- Completed_data_filled
+Completed_data_filled_forecast <- na.omit(Completed_data_filled_forecast)
+Completed_data_filled_forecast$Date <- as.Date(Completed_data_filled_forecast$Date)
+
+
+
+# Initialize lists to store results
+rmse_values <- list()
+rsq_values <- list()
+
+
+# undebug(forecast_values_arimax)
+
+# Run your loop
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+  
+  # Call the function with the stepwise parameter specified
+  result <- forecast_values_arimax(industry_data, stepwise = TRUE, ic = "aicc")
+  
+  # Store the RMSE and R-squared values
+  rmse_values[[industry]] <- result$rmse
+  rsq_values[[industry]] <- result$rsq
+  
+}
+
+# Once done debugging, you can turn off debug mode
+#undebug(forecast_values_arimax) 
+
+
+
+
+
+# Print RMSE values
+print(rmse_values)
+
+# Print R-squared values
+#print(rsq_values)
+
+```
+
+
+
+```{r}
+
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+  
+  autoarima1 <- forecast::auto.arima(
+  x = ts(industry_data$Job_vacancies_Value),
+  xreg = ts(cbind(industry_data$Mean_Volume.y ,industry_data$mean_TB.CDN.1Y.MID)),
+  max.p = 3
+  )
+  
+  # Calculate accuracy measures
+  accuracy_result <- accuracy(autoarima1)
+  rmse_value <- accuracy_result[1, "RMSE"]
+  
+  forecast::checkresiduals(autoarima1)
+  plot(ts(industry_data$Job_vacancies_Value),  main = paste("Job Vacancies for NAICS:", industry, 
+                                                             "\nRMSE:", round(rmse_value, 2)))
+  lines(fitted(autoarima1), col = 'red')
+  
+}
+
+
+
+
+
+```
+
+
+
+ 
+# baseline model
+
+```{r}
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+  train_data <- subset(industry_data , Date < "2021-06-01")
+  test_data <- subset(industry_data , Date >= "2021-06-01")
+  
+  autoarima2 <- auto.arima(
+    x = ts(train_data$Job_vacancies_Value),
+    max.p = 17,
+    max.d = 1,
+    max.q = 5,
+    max.P = 17,
+    max.Q = 5
+  )
+  
+  # Forecast using the ARIMA model for the length of the test data
+  forecast_values <- forecast(autoarima2, h = nrow(test_data))
+
+  # Extract the forecasted values and confidence intervals
+  forecasted_mean <- forecast_values$mean
+  forecasted_ci <- forecast_values$upper
+
+  # Calculate accuracy measures
+  accuracy_result <- accuracy(autoarima2)
+  rmse_value <- accuracy_result[1, "RMSE"]
+  
+  # Plot job vacancies with forecasted values
+  print(industry)
+  plot(ts(industry_data$Job_vacancies_Value), 
+       main = paste("Job Vacancies for NAICS:", industry, "\nRMSE:", round(rmse_value, 2)))
+  lines(forecast_values$mean, col = 'red')  # Plot forecasted values
+  legend("topleft", 
+        legend = c("Predicted", "Actual"),
+        col = c("red", "black"),
+        lty = 1,
+        cex = 0.8)
+}
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# with Exogenous variables
+```{r}
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+  train_data <- subset(industry_data , Date < "2021-06-01")
+  test_data <- subset(industry_data , Date >= "2021-06-01")
+  
+  autoarima2 <- auto.arima(
+    x = ts(train_data$Job_vacancies_Value),
+    xreg = as.matrix(cbind( train_data$mean_TB.CDN.1Y.MID ,
+                           train_data$mean_TB.CDN.30D.MID ,train_data$Mean_Volume.y)),
+    max.p = 4,
+    max.d = 2,
+    max.q = 3,
+    max.P = 1,
+    max.Q = 3
+  )
+  # Assuming you have already loaded necessary libraries including 'forecast'
+
+  # Step 1: Create exogenous variables matrix for test data
+  xreg_test <- as.matrix(cbind(test_data$mean_TB.CDN.1Y.MID,
+                               test_data$mean_TB.CDN.30D.MID,test_data$Mean_Volume.y))
+
+  # Step 2: Forecast using the ARIMA model
+  forecast_values <- forecast(autoarima2, xreg = xreg_test)
+
+  # Optionally, you can extract the forecasted values and confidence intervals
+  forecasted_mean <- forecast_values$mean
+  forecasted_ci <- forecast_values$upper
+
+  # Print or use the forecasted values as needed
+  print(forecasted_mean)
+  print(forecasted_ci)
+
+
+  
+  # Calculate accuracy measures
+  accuracy_result <- accuracy(autoarima2)
+  rmse_value <- accuracy_result[1, "RMSE"]
+  
+  # Plot job vacancies with fitted values
+  #forecast::checkresiduals(autoarima1)  
+  print(industry)
+  plot(ts(industry_data$Job_vacancies_Value), 
+       main = paste("Job Vacancies for NAICS:", industry, "\nRMSE:", round(rmse_value, 2)))
+  lines(forecast_values$mean, col = 'red')  # Plot forecasted values
+  legend("topleft", 
+        legend = c("Predicted", "Actual"),
+        col = c("red", "black"),
+        lty = 1,
+        cex = 0.8)
+}
+
+
+```
+
+
+
+# utilities
+
+```{r}
+library(tseries)
+library(rio)
+util_ds <- subset(Completed_data_filled_forecast , Completed_data_filled_forecast$NAICS == "Utilities [22]")
+
+util_ds$DATES <- as.Date(util_ds$Date)
+
+
+util_ds$cnt_ma = ma(util_ds$Job_vacancies_Value , order = 7)
+value_ma = ts(na.omit(util_ds$cnt_ma) , frequency = 30)
+
+decomp <- stl(value_ma, s.window = "periodic")
+deseasonal_val <- seasadj(decomp)
+plot(decomp)
+
+#augment Dickey-Fuller Tet
+adf.test(value_ma, alternative = "stationary")
+
+#Auto correlation and choosing Model's Order
+
+#ACF plots display correlation between a series and its lags
+Acf(value_ma , main='')
+
+#PCF plots display correlation between a series and its lags that explained by previous lag
+Pacf(value_ma , main = '')
+
+
+#difference of 1
+value_d1 = diff(deseasonal_val , differences = 2)
+plot(value_d1)
+
+adf.test(value_d1, alternative = "stationary")
+
+Acf(value_d1 , main = 'ACF for differenced data')
+Pacf(value_d1 , main = 'PACF for differenced data')
+
+
+
+# building arima
+auto.arima(deseasonal_val , seasonal = FALSE)
+
+fit <- auto.arima(deseasonal_val , seasonal = FALSE)
+tsdisplay(residuals(fit) , lag.max = 45 , main = '(1,1,1) Model Residuals')
+
+#graph shows a serious lag at 7
+fit2 <- arima(deseasonal_val , order = c(1,2,7))
+tsdisplay(residuals(fit2) , lag.max = 40 , main = 'Seasonal Model Residuals')
+
+# forecast the fit model
+fcast <- forecast(fit2 , h=30)
+plot(fcast)
+
+
+
+# Test the model performance with a holdout set
+hold <- window(ts(deseasonal_val) , start = 80)
+fit_no_holdout <- arima(ts(deseasonal_val[-c(80:92)]) , order = c(1,2,7))
+fcast_no_holdout <- forecast(fit_no_holdout , h = 12)
+plot(fcast_no_holdout, main = '')
+lines(ts(deseasonal_val))
+
+#now lets bring seasonality back to the model
+fit_w_seasonality = auto.arima(deseasonal_val , seasonal = TRUE)
+seas_fcast <- forecast(fit_w_seasonality , h =15)
+plot(seas_fcast)
+
+lines(ts(value_ma))
+lines(ts(util_ds$Job_vacancies_Value))
+
+
+#Test against Original  auto Arima pdq values
+tsdisplay(residuals(fit_w_seasonality) , lag.max = 30 , main = "Seasonal Model Residuals")
+
+fit3 = auto.arima(deseasonal_val , seasonal = FALSE)
+tsdisplay(residuals(fit3) , main = 'Seasonal Model Residuals 3')
+
+# evidence of lag 7
+fit4 = arima(deseasonal_val , order = c(1,2,7))
+tsdisplay(residuals(fit4) , main = "Seasonal Model Residuals 4")
+
+fit5 = arima(deseasonal_val , order = c(1,1,1))
+tsdisplay(residuals(fit5) , main = "Seasonal Model Residuals 4")
+
+
+
+
+#Final fit and Tested ARIMA forecast
+par(mfrow = c(2,2))
+
+fcast <- forecast(fit_w_seasonality, h=20) #auto Arima -> c(1,1,0) with seasonality
+plot(fcast)
+
+fcast2 <- forecast(fit3 , h=20) #auto Arima -> c(1,1,0) without sseasonality
+plot(fcast2)
+
+fcast3 <- forecast(fit4 , h=20) #Custom Arima -> c(1,2,7) fit
+plot(fcast3)
+
+fcast4 <- forecast(fit5 , h=20) #Custom Arima -> c(1,1,1) fit
+plot(fcast4)
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 4
+
+```{r}
+
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+  
+  autoarima1 <- forecast::auto.arima(
+    x = ts(industry_data$Job_vacancies_Value),
+    xreg = ts(cbind(industry_data$Mean_Volume.y, industry_data$mean_TB.CDN.1Y.MID)),
+    max.p = 1
+  )
+  
+  # Calculate accuracy measures
+  accuracy_result <- accuracy(autoarima1)
+  rmse_value <- accuracy_result[1, "RMSE"]
+  
+  # Plot job vacancies with fitted values
+  forecast::checkresiduals(autoarima1)
+  plot(ts(industry_data$Job_vacancies_Value), 
+       main = paste("Job Vacancies for NAICS:", industry, "\nRMSE:", round(rmse_value, 2)))
+  lines(fitted(autoarima1), col = 'red')
+
+  summary(autoarima1)  
+  
+}
+
+
+```
+
+
+
+
+
+
+```{r}
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+  
+  tryCatch({
+    # Define the grid of parameter values to search
+    max_p_values <- c(0, 1, 2, 3)
+    max_d_values <- c(0, 1)
+    max_q_values <- c(0, 1, 2, 3)
+    max_P_values <- c(2)
+    max_Q_values <- c(0, 1, 2, 3)
+    
+    # Initialize variables to store the best model and its corresponding error metric
+    best_model <- NULL
+    best_rmse <- Inf
+    best_params <- NULL
+    
+    for (max_p in max_p_values) {
+      for (max_d in max_d_values) {
+        for (max_q in max_q_values) {
+          for (max_P in max_P_values) {
+            for (max_Q in max_Q_values) {
+              # Fit the model
+              autoarima_model <- auto.arima(
+                x = ts(industry_data$Job_vacancies_Value),
+                xreg = ts(cbind(industry_data$Mean_Volume.y, industry_data$mean_TB.CDN.1Y.MID)),
+                max.p = max_p,
+                max.d = max_d,
+                max.q = max_q,
+                max.P = max_P,
+                max.Q = max_Q,
+                seasonal = TRUE
+              )
+              
+              # Calculate accuracy measures
+              accuracy_result <- accuracy(autoarima_model)
+              rmse_value <- accuracy_result[1, "RMSE"]
+              
+              # Update the best model if the current one has a lower RMSE
+              if (rmse_value < best_rmse) {
+                best_model <- autoarima_model
+                best_rmse <- rmse_value
+                best_params <- list(max_p = max_p, max_d = max_d, max_q = max_q, max_P = max_P, max_Q = max_Q)
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    # Print the best parameters and RMSE for the current industry
+    print(paste("Best Parameters for Industry", industry, ":", best_params))
+    print(paste("Best RMSE for Industry", industry, ":", best_rmse))
+    
+    # Plot job vacancies with fitted values from the best model for the current industry
+    plot(ts(industry_data$Job_vacancies_Value), 
+         xlab = "Date",
+         ylab = "Job Vacancies",
+         main = paste("Job Vacancies for NAICS:", industry, "\nRMSE:", round(best_rmse, 2)))
+    lines(fitted(best_model), col = 'red')
+    legend("topright", 
+           legend = c("Predicted", "Actual"),
+           col = c("red", "black"),
+           lty = 1,
+           cex = 0.8)
+    date_labels <- seq(as.Date(industry_data$Date), by = "year")
+    axis(1, at = seq_along(date_labels), labels = format(date_labels, "%Y"), cex.axis = 0.8)
+    forecast()
+    forecast::checkresiduals(best_model)
+    
+  }, error = function(e) {
+    cat("Error occurred for industry:", industry, "\n")
+    cat("Error message:", conditionMessage(e), "\n")
+  })
+}
+
+
+```
+
+
+
+
+
+# adding horizontal
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## using GAM model
+
+```{r}
+#split_Completed_data_filled_forecast <- initial_split(Completed_data_filled_forecast, prop = .8)
+#data_Train <- training(split_Completed_data_filled_forecast)
+#data_Test <- testing(split_Completed_data_filled_forecast)
+#datafolds <- vfold_cv(data_Train , v=5)
+
+gam_model = gen_additive_mod(mode = "regression") |> 
+  set_engine("mgcv")
+
+forecast_values_GAM <- function(industry1){
+  
+  #Split the data
+  split_industry1 <- initial_split(industry1, prop = .8)
+  data_Train <- training(split_industry1)
+  data_Test <- testing(split_industry1)
+  
+  gam_fit <- 
+    workflow() |>
+    add_variables(
+      outcomes = "Job_vacancies_Value",
+      predictors = c("mean_TB_CDN_30D_MID", "Mean_Volume.y")
+    ) |>
+    add_model(
+      gam_model,
+      formula = Job_vacancies_Value ~ s(mean_TB_CDN_30D_MID, Mean_Volume.y, k = 5)
+    ) |>
+    fit(data = data_Train)
+  
+  # Obtain predicted values for the test data
+  predicted_values <- predict(gam_fit, new_data = data_Test)
+  
+  # Calculate RMSE
+  rmse <- sqrt(mean((data_Test$Job_vacancies_Value - predicted_values)^2))
+  
+  # Calculate R-squared
+  actual_values <- data_Test$Job_vacancies_Value
+  rsq <- 1 - sum((actual_values - predicted_values)^2) / sum((actual_values - mean(actual_values))^2)
+  
+  # Return RMSE and R-squared
+  return(list(rmse = rmse, rsq = rsq))
+}
+
+# Example usage
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data1 <- subset(Completed_data_filled_forecast, NAICS == industry)
+  
+  # Call the function with the stepwise parameter specified
+  result <- forecast_values_GAM(industry_data1)
+  print(paste("Industry:", industry))
+  print(result)
+}
+
+
+
+
+```
+
+
+## predicting the January and February 2024 values
+
+```{r}
+forecast_values_arimax <- function(industry_data, seasonal = TRUE, stationary = TRUE, stepwise = "both", ic = "aicc", max_order = NULL, max_seasonal_order = NULL) {
+
+  # Check for missing values in Mean_Volume.y and mean_TB_CDN_30D_MID
+#  if (anyNA(industry_data$Mean_Volume.y) || anyNA(industry_data$mean_TB_CDN_30D_MID)) {
+#    stop("Missing values detected in the predictor columns. Please handle missing values before fitting the ARIMA model.")
+#  }
+  
+  # Filter data where Date is before 2023-12-01
+  train_data <- subset(industry_data, Date < as.Date("2023-12-01"))
+  test_data <- subset(industry_data , Date > as.Date("2023-11-01"))
+  
+  # Extract time series data
+  ts_train_data <- ts(train_data$Job_vacancies_Value, frequency = 12)
+  
+  # Fit ARIMA model with auto.arima()
+  # Call auto.arima with appropriate parameters
+  arima_model <- auto.arima(ts_train_data, 
+                            xreg = cbind(train_data$Mean_Volume.y, train_data$mean_TB_CDN_30D_MID),
+                            seasonal = seasonal, 
+                            stationary = stationary, 
+                            stepwise = stepwise, 
+                            ic = ic,
+                            max.p = max_order,
+                            max.q = max_order,
+                            max.P = max_seasonal_order,
+                            max.Q = max_seasonal_order)
+  
+  # Forecast values for the testing period
+  forecast_xreg <- cbind(test_data$Mean_Volume.y, test_data$mean_TB_CDN_30D_MID)
+  forecast_values <- forecast(arima_model, xreg = forecast_xreg)
+  
+  # Extract the forecasted values
+  forecasted_values <- forecast_values$mean
+  
+  # Calculate RMSE
+  actual_values <- industry_data$Job_vacancies_Value
+  rmse <- sqrt(mean((actual_values - forecasted_values)^2))
+  
+  # Calculate R-squared for the model
+  predicted_values <- forecast(arima_model, h = length(industry_data$Job_vacancies_Value), xreg = forecast_xreg)$mean
+  rsq <- 1 - sum((actual_values - predicted_values)^2) / sum((actual_values - mean(actual_values))^2)
+  
+  # Return RMSE and R-squared
+  return(list(rmse = rmse, rsq = rsq))
+}
+
+
+for (industry in unique(Completed_data_filled_forecast$NAICS)) {
+  # Subset data for the current industry
+  industry_data <- subset(Completed_data_filled_forecast, NAICS == industry)
+  
+  # Call the function with the stepwise parameter specified
+  result <- forecast_values_arimax(industry_data, stepwise = TRUE, ic = "aicc")
+}
+
+
+
+
+```
+
+
+```{r}
+#checking the relationships
+correlation_matrix <- cor(Completed_data_filled_forecast[, c("Job_vacancies_Value", "Mean_Volume.y", "mean_CL.CDN.MOST.1DL", "mean_AVG.INTWO", "mean_TB.CDN.30D.MID", "mean_TB.CDN.60D.MID", "mean_TB.CDN.90D.MID", "mean_TB.CDN.180D.MID", "mean_TB.CDN.1Y.MID")])
+
+plot(Completed_data_filled_forecast$mean_AVG.INTWO, Completed_data_filled_forecast$Job_vacancies_Value)
+plot(Completed_data_filled_forecast$mean_AVG.INTWO, Completed_data_filled_forecast$Job_vacancies_Value)
+lines(lowess(Completed_data_filled_forecast$mean_AVG.INTWO, Completed_data_filled_forecast$Job_vacancies_Value), col = "red")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
